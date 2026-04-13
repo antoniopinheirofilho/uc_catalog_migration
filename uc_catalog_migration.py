@@ -455,9 +455,10 @@ managed_tables = [r for r in managed_tables_all if not is_internal_table(r.table
 external_tables = [r for r in all_tables if r.table_type == "EXTERNAL"]
 views = [r for r in all_tables if r.table_type == "VIEW"]
 materialized_views = [r for r in all_tables if r.table_type in ("MATERIALIZED_VIEW",)]
+metric_views = [r for r in all_tables if r.table_type in ("METRIC_VIEW",)]
 streaming_tables = [r for r in all_tables if r.table_type in ("STREAMING_TABLE",)]
 unknown_types = [r for r in all_tables if r.table_type not in (
-    "MANAGED", "TABLE", "BASE TABLE", "EXTERNAL", "VIEW", "MATERIALIZED_VIEW", "STREAMING_TABLE"
+    "MANAGED", "TABLE", "BASE TABLE", "EXTERNAL", "VIEW", "MATERIALIZED_VIEW", "METRIC_VIEW", "STREAMING_TABLE"
 )]
 
 print(f"\nManaged tables:      {len(managed_tables)}")
@@ -465,6 +466,7 @@ if internal_tables:
     print(f"Internal tables:     {len(internal_tables)}  (SKIPPED — MV/DLT backing tables)")
 print(f"Views:               {len(views)}")
 print(f"Materialized views:  {len(materialized_views)}")
+print(f"Metric views:        {len(metric_views)}")
 print(f"External tables:     {len(external_tables)}  (OUT OF SCOPE)")
 print(f"Streaming tables:    {len(streaming_tables)}  (OUT OF SCOPE)")
 if unknown_types:
@@ -516,6 +518,9 @@ for r in views:
               "IN_SCOPE", f"owner={r.table_owner}")
 for r in materialized_views:
     write_log("inventory", "MATERIALIZED_VIEW", fqn(catalog_name, r.table_schema, r.table_name),
+              "IN_SCOPE", f"owner={r.table_owner}")
+for r in metric_views:
+    write_log("inventory", "METRIC_VIEW", fqn(catalog_name, r.table_schema, r.table_name),
               "IN_SCOPE", f"owner={r.table_owner}")
 for r in external_tables:
     write_log("inventory", "TABLE", fqn(catalog_name, r.table_schema, r.table_name),
@@ -660,6 +665,7 @@ Objects to migrate:
   Managed tables:          {len(managed_tables)}
   Views:                   {len(views)}
   Materialized views:      {len(materialized_views)}
+  Metric views:            {len(metric_views)}
   Functions:               {len(functions)}
   Managed volumes:         {len(managed_volumes)}
 
@@ -1055,8 +1061,53 @@ for mv in materialized_views:
     })
     print(f"  Captured MV DDL:   {catalog_name}.{schema}.{mv_name} ({'OK' if ddl else 'NO DDL'})")
 
-print(f"\nCaptured {len(view_definitions)} view(s) and {len(mv_definitions)} materialized view(s).")
-write_log("capture_ddl", "VIEW", catalog_name, "SUCCESS", f"views={len(view_definitions)} mvs={len(mv_definitions)}")
+# Capture metric view definitions
+# SHOW CREATE TABLE does not work on metric views. Metric views do not appear in
+# information_schema.views either. Use DESCRIBE TABLE EXTENDED to extract the YAML body
+# from the "View Text" row.
+metric_view_definitions = []
+for metv in metric_views:
+    schema, metv_name = metv.table_schema, metv.table_name
+    yaml_body = None
+
+    # Try DESCRIBE TABLE EXTENDED from cluster first
+    ok_desc, desc_df = run_quiet(f"DESCRIBE TABLE EXTENDED {q(catalog_name, schema, metv_name)}")
+    if ok_desc:
+        for row in desc_df.collect():
+            if row[0] and row[0].strip() == "View Text":
+                yaml_body = row[1]
+                break
+
+    # Fallback: try via SQL warehouse
+    if not yaml_body and sql_warehouse_id:
+        ok_wh, wh_result = run_on_warehouse(
+            f"DESCRIBE TABLE EXTENDED {q(catalog_name, schema, metv_name)}", sql_warehouse_id
+        )
+        if ok_wh:
+            for row in wh_result.get("result", {}).get("data_array", []):
+                if row[0] and row[0].strip() == "View Text":
+                    yaml_body = row[1]
+                    break
+
+    grants = get_grants("VIEW", q(catalog_name, schema, metv_name))
+    owner = get_table_owner(catalog_name, schema, metv_name)
+    comment = get_table_comment(catalog_name, schema, metv_name)
+    tags = get_table_tags(catalog_name, schema, metv_name)
+    metric_view_definitions.append({
+        "schema": schema,
+        "name": metv_name,
+        "yaml_body": yaml_body,
+        "grants": grants,
+        "owner": owner,
+        "comment": comment,
+        "tags": tags,
+    })
+    print(f"  Captured Metric View: {catalog_name}.{schema}.{metv_name} ({'OK' if yaml_body else 'NO YAML'})")
+
+print(f"\nCaptured {len(view_definitions)} view(s), {len(mv_definitions)} materialized view(s), "
+      f"and {len(metric_view_definitions)} metric view(s).")
+write_log("capture_ddl", "VIEW", catalog_name, "SUCCESS",
+          f"views={len(view_definitions)} mvs={len(mv_definitions)} metric_views={len(metric_view_definitions)}")
 
 # COMMAND ----------
 
@@ -1163,6 +1214,64 @@ if remaining:
         obj_fqn = fqn(catalog_name, vdef["schema"], vdef["name"])
         write_log("views", "VIEW", obj_fqn, "FAILED", f"Failed after {max_retries} retries")
         print(f"  FAILED after {max_retries} retries: {obj_fqn}")
+
+# ---------------------------------------------------------------------------
+# Recreate metric views
+# ---------------------------------------------------------------------------
+print(f"\nRecreating {len(metric_view_definitions)} metric view(s) ...")
+
+remaining_metv = list(metric_view_definitions)
+max_retries_metv = 10
+
+for attempt in range(1, max_retries_metv + 1):
+    if not remaining_metv:
+        break
+    still_failing_metv = []
+    for mdef in remaining_metv:
+        schema, metv_name = mdef["schema"], mdef["name"]
+        yaml_body = mdef["yaml_body"]
+        tgt_fq = q(catalog_name, schema, metv_name)
+        obj_fqn = fqn(catalog_name, schema, metv_name)
+
+        if not yaml_body:
+            print(f"  SKIP {obj_fqn}: no YAML body captured")
+            write_log("metric_views", "METRIC_VIEW", obj_fqn, "SKIPPED", "No YAML body")
+            continue
+
+        t0 = time.time()
+        # Reconstruct CREATE VIEW ... WITH METRICS LANGUAGE YAML DDL
+        comment_clause = ""
+        if mdef["comment"]:
+            comment_clause = f"\nCOMMENT '{escape_sql(mdef['comment'])}'"
+        create_ddl = f"CREATE VIEW {tgt_fq}\nWITH METRICS\nLANGUAGE YAML{comment_clause}\nAS $$\n{yaml_body}\n$$"
+
+        ok, err = run_quiet(create_ddl)
+        if ok:
+            # Restore tags
+            if mdef["tags"]:
+                tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in mdef["tags"])
+                run_quiet(f"ALTER VIEW {tgt_fq} SET TAGS ({tag_pairs})")
+
+            gs, gf = apply_grants(mdef["grants"], "VIEW", tgt_fq, "metric_views", obj_fqn)
+            set_owner("VIEW", tgt_fq, mdef["owner"])
+
+            elapsed = time.time() - t0
+            write_log("metric_views", "METRIC_VIEW", obj_fqn, "SUCCESS",
+                      f"attempt={attempt} grants={gs}", elapsed)
+            print(f"  OK: {obj_fqn} (attempt {attempt}) [{elapsed:.1f}s]")
+        else:
+            still_failing_metv.append(mdef)
+
+    remaining_metv = still_failing_metv
+    if remaining_metv and attempt < max_retries_metv:
+        print(f"  Retry {attempt}: {len(remaining_metv)} metric view(s) pending ...")
+
+if remaining_metv:
+    for mdef in remaining_metv:
+        obj_fqn = fqn(catalog_name, mdef["schema"], mdef["name"])
+        write_log("metric_views", "METRIC_VIEW", obj_fqn, "FAILED",
+                  f"Failed after {max_retries_metv} retries")
+        print(f"  FAILED after {max_retries_metv} retries: {obj_fqn}")
 
 # ---------------------------------------------------------------------------
 # Recreate materialized views (requires SQL warehouse)
@@ -1300,6 +1409,17 @@ match = new_mvs == bkp_mvs_count
 checks.append(("materialized_views_count", new_mvs, bkp_mvs_count, match))
 if not match: validation_passed = False
 print(f"  Materialized views:   new={new_mvs}, original={bkp_mvs_count}  [{'PASS' if match else 'FAIL'}]")
+
+# Metric views
+new_metvs = run(f"""
+    SELECT table_name FROM {q(catalog_name)}.information_schema.tables
+    WHERE table_schema != 'information_schema' AND table_type = 'METRIC_VIEW'
+""").count()
+bkp_metvs_count = len(metric_views)
+match = new_metvs == bkp_metvs_count
+checks.append(("metric_views_count", new_metvs, bkp_metvs_count, match))
+if not match: validation_passed = False
+print(f"  Metric views:         new={new_metvs}, original={bkp_metvs_count}  [{'PASS' if match else 'FAIL'}]")
 
 # Functions
 ok_fn_new, fn_new_df = run_quiet(f"""
