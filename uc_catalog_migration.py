@@ -1234,135 +1234,10 @@ print(f"  '{bkp_catalog}' is the original catalog backup.")
 # COMMAND ----------
 
 # ---------------------------------------------------------------------------
-# Recreate regular views (with retry loop for dependency ordering)
+# 1. Recreate materialized views FIRST (they hold data like tables;
+#    regular views and metric views may depend on them)
 # ---------------------------------------------------------------------------
-print(f"Recreating {len(view_definitions)} view(s) ...")
-
-remaining = list(view_definitions)
-max_retries = 10
-
-for attempt in range(1, max_retries + 1):
-    if not remaining:
-        break
-    still_failing = []
-    for vdef in remaining:
-        schema, view_name = vdef["schema"], vdef["name"]
-        ddl = vdef["ddl"]
-        view_body = vdef.get("view_body")
-        tgt_fq = q(catalog_name, schema, view_name)
-        obj_fqn = fqn(catalog_name, schema, view_name)
-
-        if not ddl and not view_body:
-            print(f"  SKIP {obj_fqn}: no DDL captured")
-            write_log("views", "VIEW", obj_fqn, "SKIPPED", "No DDL captured")
-            continue
-
-        t0 = time.time()
-        # Try SHOW CREATE TABLE DDL first
-        ok, err = False, "no DDL"
-        if ddl:
-            ok, err = run_quiet(ddl)
-        # Fallback: build CREATE VIEW from view_body (information_schema.views)
-        if not ok and view_body:
-            comment_clause = ""
-            if vdef["comment"]:
-                comment_clause = f" COMMENT '{escape_sql(vdef['comment'])}'"
-            fallback_ddl = f"CREATE VIEW {tgt_fq}{comment_clause} AS {view_body}"
-            ok, err = run_quiet(fallback_ddl)
-        if ok:
-            if vdef["comment"]:
-                run_quiet(f"COMMENT ON TABLE {tgt_fq} IS '{escape_sql(vdef['comment'])}'")
-
-            if vdef["tags"]:
-                tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in vdef["tags"])
-                run_quiet(f"ALTER VIEW {tgt_fq} SET TAGS ({tag_pairs})")
-
-            restore_column_tags(vdef.get("col_tags", []), "VIEW", tgt_fq)
-
-            gs, gf = apply_grants(vdef["grants"], "VIEW", tgt_fq, "views", obj_fqn)
-            set_owner("VIEW", tgt_fq, vdef["owner"])
-
-            elapsed = time.time() - t0
-            write_log("views", "VIEW", obj_fqn, "SUCCESS",
-                      f"attempt={attempt} grants={gs}", elapsed)
-            print(f"  OK: {obj_fqn} (attempt {attempt}) [{elapsed:.1f}s]")
-        else:
-            still_failing.append(vdef)
-
-    remaining = still_failing
-    if remaining and attempt < max_retries:
-        print(f"  Retry {attempt}: {len(remaining)} view(s) pending (likely dependency ordering) ...")
-
-if remaining:
-    for vdef in remaining:
-        obj_fqn = fqn(catalog_name, vdef["schema"], vdef["name"])
-        write_log("views", "VIEW", obj_fqn, "FAILED", f"Failed after {max_retries} retries")
-        print(f"  FAILED after {max_retries} retries: {obj_fqn}")
-
-# ---------------------------------------------------------------------------
-# Recreate metric views
-# ---------------------------------------------------------------------------
-print(f"\nRecreating {len(metric_view_definitions)} metric view(s) ...")
-
-remaining_metv = list(metric_view_definitions)
-max_retries_metv = 10
-
-for attempt in range(1, max_retries_metv + 1):
-    if not remaining_metv:
-        break
-    still_failing_metv = []
-    for mdef in remaining_metv:
-        schema, metv_name = mdef["schema"], mdef["name"]
-        yaml_body = mdef["yaml_body"]
-        tgt_fq = q(catalog_name, schema, metv_name)
-        obj_fqn = fqn(catalog_name, schema, metv_name)
-
-        if not yaml_body:
-            print(f"  SKIP {obj_fqn}: no YAML body captured")
-            write_log("metric_views", "METRIC_VIEW", obj_fqn, "SKIPPED", "No YAML body")
-            continue
-
-        t0 = time.time()
-        # Reconstruct CREATE VIEW ... WITH METRICS LANGUAGE YAML DDL
-        comment_clause = ""
-        if mdef["comment"]:
-            comment_clause = f"\nCOMMENT '{escape_sql(mdef['comment'])}'"
-        create_ddl = f"CREATE VIEW {tgt_fq}\nWITH METRICS\nLANGUAGE YAML{comment_clause}\nAS $$\n{yaml_body}\n$$"
-
-        ok, err = run_quiet(create_ddl)
-        if ok:
-            # Restore tags
-            if mdef["tags"]:
-                tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in mdef["tags"])
-                run_quiet(f"ALTER VIEW {tgt_fq} SET TAGS ({tag_pairs})")
-
-            restore_column_tags(mdef.get("col_tags", []), "VIEW", tgt_fq)
-
-            gs, gf = apply_grants(mdef["grants"], "VIEW", tgt_fq, "metric_views", obj_fqn)
-            set_owner("VIEW", tgt_fq, mdef["owner"])
-
-            elapsed = time.time() - t0
-            write_log("metric_views", "METRIC_VIEW", obj_fqn, "SUCCESS",
-                      f"attempt={attempt} grants={gs}", elapsed)
-            print(f"  OK: {obj_fqn} (attempt {attempt}) [{elapsed:.1f}s]")
-        else:
-            still_failing_metv.append(mdef)
-
-    remaining_metv = still_failing_metv
-    if remaining_metv and attempt < max_retries_metv:
-        print(f"  Retry {attempt}: {len(remaining_metv)} metric view(s) pending ...")
-
-if remaining_metv:
-    for mdef in remaining_metv:
-        obj_fqn = fqn(catalog_name, mdef["schema"], mdef["name"])
-        write_log("metric_views", "METRIC_VIEW", obj_fqn, "FAILED",
-                  f"Failed after {max_retries_metv} retries")
-        print(f"  FAILED after {max_retries_metv} retries: {obj_fqn}")
-
-# ---------------------------------------------------------------------------
-# Recreate materialized views (requires SQL warehouse)
-# ---------------------------------------------------------------------------
-print(f"\nRecreating {len(mv_definitions)} materialized view(s) ...")
+print(f"Recreating {len(mv_definitions)} materialized view(s) ...")
 
 if mv_definitions and not sql_warehouse_id:
     print("  WARNING: sql_warehouse_id not set — MV recreation requires a SQL warehouse.")
@@ -1414,6 +1289,101 @@ elif mv_definitions and sql_warehouse_id:
             elapsed = time.time() - t0
             write_log("materialized_views", "MATERIALIZED_VIEW", obj_fqn, "FAILED", str(e), elapsed)
             print(f"    FAILED: {e}")
+
+# ---------------------------------------------------------------------------
+# 2. Recreate regular views and metric views (combined retry loop)
+#    Views and metric views can depend on tables, MVs, and each other.
+#    The retry loop handles cross-type dependency ordering.
+# ---------------------------------------------------------------------------
+print(f"\nRecreating {len(view_definitions)} view(s) and {len(metric_view_definitions)} metric view(s) ...")
+
+# Build a combined list with type tags
+all_views_to_create = []
+for vdef in view_definitions:
+    all_views_to_create.append(("VIEW", vdef))
+for mdef in metric_view_definitions:
+    all_views_to_create.append(("METRIC_VIEW", mdef))
+
+remaining = list(all_views_to_create)
+max_retries = 10
+
+for attempt in range(1, max_retries + 1):
+    if not remaining:
+        break
+    still_failing = []
+    for view_type, vdef in remaining:
+        schema = vdef["schema"]
+        name = vdef["name"]
+        tgt_fq = q(catalog_name, schema, name)
+        obj_fqn = fqn(catalog_name, schema, name)
+        log_phase = "views" if view_type == "VIEW" else "metric_views"
+
+        t0 = time.time()
+
+        if view_type == "VIEW":
+            ddl = vdef["ddl"]
+            view_body = vdef.get("view_body")
+            if not ddl and not view_body:
+                print(f"  SKIP {obj_fqn}: no DDL captured")
+                write_log(log_phase, view_type, obj_fqn, "SKIPPED", "No DDL captured")
+                continue
+            # Try SHOW CREATE TABLE DDL first
+            ok, err = False, "no DDL"
+            if ddl:
+                ok, err = run_quiet(ddl)
+            # Fallback: build CREATE VIEW from view_body (information_schema.views)
+            if not ok and view_body:
+                comment_clause = ""
+                if vdef["comment"]:
+                    comment_clause = f" COMMENT '{escape_sql(vdef['comment'])}'"
+                fallback_ddl = f"CREATE VIEW {tgt_fq}{comment_clause} AS {view_body}"
+                ok, err = run_quiet(fallback_ddl)
+
+        elif view_type == "METRIC_VIEW":
+            yaml_body = vdef.get("yaml_body")
+            if not yaml_body:
+                print(f"  SKIP {obj_fqn}: no YAML body captured")
+                write_log(log_phase, view_type, obj_fqn, "SKIPPED", "No YAML body")
+                continue
+            comment_clause = ""
+            if vdef["comment"]:
+                comment_clause = f"\nCOMMENT '{escape_sql(vdef['comment'])}'"
+            create_ddl = f"CREATE VIEW {tgt_fq}\nWITH METRICS\nLANGUAGE YAML{comment_clause}\nAS $$\n{yaml_body}\n$$"
+            ok, err = run_quiet(create_ddl)
+
+        if ok:
+            # Restore comment (for regular views created via DDL)
+            if view_type == "VIEW" and vdef["comment"]:
+                run_quiet(f"COMMENT ON TABLE {tgt_fq} IS '{escape_sql(vdef['comment'])}'")
+
+            # Restore tags
+            if vdef.get("tags"):
+                tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in vdef["tags"])
+                run_quiet(f"ALTER VIEW {tgt_fq} SET TAGS ({tag_pairs})")
+
+            restore_column_tags(vdef.get("col_tags", []), "VIEW", tgt_fq)
+
+            grant_type = "VIEW" if view_type in ("VIEW", "METRIC_VIEW") else "TABLE"
+            gs, gf = apply_grants(vdef["grants"], grant_type, tgt_fq, log_phase, obj_fqn)
+            set_owner("VIEW", tgt_fq, vdef["owner"])
+
+            elapsed = time.time() - t0
+            write_log(log_phase, view_type, obj_fqn, "SUCCESS",
+                      f"attempt={attempt} grants={gs}", elapsed)
+            print(f"  OK: {obj_fqn} [{view_type}] (attempt {attempt}) [{elapsed:.1f}s]")
+        else:
+            still_failing.append((view_type, vdef))
+
+    remaining = still_failing
+    if remaining and attempt < max_retries:
+        print(f"  Retry {attempt}: {len(remaining)} view(s) pending (likely dependency ordering) ...")
+
+if remaining:
+    for view_type, vdef in remaining:
+        obj_fqn = fqn(catalog_name, vdef["schema"], vdef["name"])
+        log_phase = "views" if view_type == "VIEW" else "metric_views"
+        write_log(log_phase, view_type, obj_fqn, "FAILED", f"Failed after {max_retries} retries")
+        print(f"  FAILED after {max_retries} retries: {obj_fqn} [{view_type}]")
 
 # COMMAND ----------
 
