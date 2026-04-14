@@ -319,6 +319,28 @@ def get_table_owner(cat, schema, table):
     return rows[0][0] if rows and rows[0][0] else ""
 
 
+def get_catalog_tags(cat):
+    """Return list of (tag_name, tag_value) for a catalog."""
+    ok, df = run_quiet(
+        f"SELECT tag_name, tag_value FROM {q(cat)}.information_schema.catalog_tags "
+        f"WHERE catalog_name = '{cat}'"
+    )
+    if not ok:
+        return []
+    return [(r[0], r[1]) for r in df.collect()]
+
+
+def get_schema_tags(cat, schema):
+    """Return list of (tag_name, tag_value) for a schema."""
+    ok, df = run_quiet(
+        f"SELECT tag_name, tag_value FROM {q(cat)}.information_schema.schema_tags "
+        f"WHERE schema_name = '{schema}'"
+    )
+    if not ok:
+        return []
+    return [(r[0], r[1]) for r in df.collect()]
+
+
 def get_table_tags(cat, schema, table):
     """Return list of (tag_name, tag_value) for a table."""
     ok, df = run_quiet(
@@ -328,6 +350,26 @@ def get_table_tags(cat, schema, table):
     if not ok:
         return []
     return [(r[0], r[1]) for r in df.collect()]
+
+
+def restore_column_tags(col_tags, object_type, target_fq):
+    """Apply column tags to a target table/view. col_tags is [(col_name, tag_name, tag_value), ...]."""
+    if not col_tags:
+        return
+    by_col = defaultdict(list)
+    for ct in col_tags:
+        by_col[ct[0]].append((ct[1], ct[2]))
+    for col_name, ctags in by_col.items():
+        tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in ctags)
+        ok, err = run_quiet(f"ALTER {object_type} {target_fq} ALTER COLUMN `{col_name}` SET TAGS ({tag_pairs})")
+        if not ok:
+            # Try tags individually — a tag policy may reject one but allow others
+            for tag_name, tag_value in ctags:
+                ok2, err2 = run_quiet(
+                    f"ALTER {object_type} {target_fq} ALTER COLUMN `{col_name}` SET TAGS ('{tag_name}' = '{escape_sql(tag_value)}')"
+                )
+                if not ok2:
+                    print(f"    WARN column tag `{col_name}`.`{tag_name}`: {err2}")
 
 
 def get_column_tags(cat, schema, table):
@@ -709,6 +751,16 @@ cat_grants = get_grants("CATALOG", q(catalog_name))
 gs, gf = apply_grants(cat_grants, "CATALOG", q(aux_catalog), "create_catalog", aux_catalog)
 print(f"  Catalog grants applied: {gs} succeeded, {gf} failed.")
 
+# Apply catalog-level tags
+cat_tags = get_catalog_tags(catalog_name)
+if cat_tags:
+    tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in cat_tags)
+    ok_ct, err_ct = run_quiet(f"ALTER CATALOG {q(aux_catalog)} SET TAGS ({tag_pairs})")
+    if ok_ct:
+        print(f"  Catalog tags applied: {len(cat_tags)}")
+    else:
+        print(f"  WARN catalog tags: {err_ct}")
+
 # ---------------------------------------------------------------------------
 # Migrate schemas
 # ---------------------------------------------------------------------------
@@ -734,6 +786,14 @@ for schema_name in schemas:
                 run(f"ALTER SCHEMA {q(aux_catalog, schema_name)} SET DBPROPERTIES {schema_info['properties']}")
             except Exception as e:
                 print(f"    WARN properties: {e}")
+
+        # Apply schema tags
+        s_tags = get_schema_tags(catalog_name, schema_name)
+        if s_tags:
+            tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in s_tags)
+            ok_st, err_st = run_quiet(f"ALTER SCHEMA {q(aux_catalog, schema_name)} SET TAGS ({tag_pairs})")
+            if not ok_st:
+                print(f"    WARN schema tags: {err_st}")
 
         s_grants = get_grants("SCHEMA", q(catalog_name, schema_name))
         gs, gf = apply_grants(s_grants, "SCHEMA", q(aux_catalog, schema_name), "schemas", fqn(aux_catalog, schema_name, ""))
@@ -782,18 +842,20 @@ for tbl in managed_tables:
         tags = get_table_tags(catalog_name, schema, table)
         if tags:
             tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in tags)
-            run(f"ALTER TABLE {tgt} SET TAGS ({tag_pairs})")
-            print(f"    Tags restored: {len(tags)}")
+            ok_tt, err_tt = run_quiet(f"ALTER TABLE {tgt} SET TAGS ({tag_pairs})")
+            if ok_tt:
+                print(f"    Tags restored: {len(tags)}")
+            else:
+                # Try tags individually — a tag policy may reject one but allow others
+                for tag_name, tag_value in tags:
+                    ok2, err2 = run_quiet(f"ALTER TABLE {tgt} SET TAGS ('{tag_name}' = '{escape_sql(tag_value)}')")
+                    if not ok2:
+                        print(f"    WARN table tag `{tag_name}`: {err2}")
 
         # Restore column tags
         col_tags = get_column_tags(catalog_name, schema, table)
+        restore_column_tags(col_tags, "TABLE", tgt)
         if col_tags:
-            by_col = defaultdict(list)
-            for ct in col_tags:
-                by_col[ct[0]].append((ct[1], ct[2]))
-            for col_name, ctags in by_col.items():
-                tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in ctags)
-                run(f"ALTER TABLE {tgt} ALTER COLUMN `{col_name}` SET TAGS ({tag_pairs})")
             print(f"    Column tags restored: {len(col_tags)}")
 
         # Restore PK constraints
@@ -970,6 +1032,20 @@ for vol in managed_volumes:
         except Exception as e:
             print(f"    WARN copying files: {e}")
 
+        # Restore volume tags (volumes use information_schema.volume_tags, not table_tags)
+        ok_vtags, vtags_df = run_quiet(
+            f"SELECT tag_name, tag_value FROM {q(catalog_name)}.information_schema.volume_tags "
+            f"WHERE schema_name = '{schema}' AND volume_name = '{vol_name}'"
+        )
+        v_tags = [(r[0], r[1]) for r in vtags_df.collect()] if ok_vtags else []
+        if v_tags:
+            tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in v_tags)
+            ok_vt, err_vt = run_quiet(f"ALTER VOLUME {tgt_fq} SET TAGS ({tag_pairs})")
+            if ok_vt:
+                print(f"    Tags restored: {len(v_tags)}")
+            else:
+                print(f"    WARN volume tags: {err_vt}")
+
         v_grants = get_grants("VOLUME", src_fq)
         gs, gf = apply_grants(v_grants, "VOLUME", tgt_fq, "volumes", obj_fqn)
 
@@ -1022,6 +1098,7 @@ for v in views:
     owner = get_table_owner(catalog_name, schema, view_name)
     comment = get_table_comment(catalog_name, schema, view_name)
     tags = get_table_tags(catalog_name, schema, view_name)
+    col_tags = get_column_tags(catalog_name, schema, view_name)
     view_definitions.append({
         "schema": schema,
         "name": view_name,
@@ -1031,6 +1108,7 @@ for v in views:
         "owner": owner,
         "comment": comment,
         "tags": tags,
+        "col_tags": col_tags,
     })
     print(f"  Captured view DDL: {catalog_name}.{schema}.{view_name}")
 
@@ -1050,6 +1128,7 @@ for mv in materialized_views:
     owner = get_table_owner(catalog_name, schema, mv_name)
     comment = get_table_comment(catalog_name, schema, mv_name)
     tags = get_table_tags(catalog_name, schema, mv_name)
+    col_tags = get_column_tags(catalog_name, schema, mv_name)
     mv_definitions.append({
         "schema": schema,
         "name": mv_name,
@@ -1057,6 +1136,7 @@ for mv in materialized_views:
         "grants": grants,
         "owner": owner,
         "comment": comment,
+        "col_tags": col_tags,
         "tags": tags,
     })
     print(f"  Captured MV DDL:   {catalog_name}.{schema}.{mv_name} ({'OK' if ddl else 'NO DDL'})")
@@ -1093,6 +1173,7 @@ for metv in metric_views:
     owner = get_table_owner(catalog_name, schema, metv_name)
     comment = get_table_comment(catalog_name, schema, metv_name)
     tags = get_table_tags(catalog_name, schema, metv_name)
+    col_tags = get_column_tags(catalog_name, schema, metv_name)
     metric_view_definitions.append({
         "schema": schema,
         "name": metv_name,
@@ -1101,6 +1182,7 @@ for metv in metric_views:
         "owner": owner,
         "comment": comment,
         "tags": tags,
+        "col_tags": col_tags,
     })
     print(f"  Captured Metric View: {catalog_name}.{schema}.{metv_name} ({'OK' if yaml_body else 'NO YAML'})")
 
@@ -1195,6 +1277,8 @@ for attempt in range(1, max_retries + 1):
                 tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in vdef["tags"])
                 run_quiet(f"ALTER VIEW {tgt_fq} SET TAGS ({tag_pairs})")
 
+            restore_column_tags(vdef.get("col_tags", []), "VIEW", tgt_fq)
+
             gs, gf = apply_grants(vdef["grants"], "VIEW", tgt_fq, "views", obj_fqn)
             set_owner("VIEW", tgt_fq, vdef["owner"])
 
@@ -1251,6 +1335,8 @@ for attempt in range(1, max_retries_metv + 1):
             if mdef["tags"]:
                 tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in mdef["tags"])
                 run_quiet(f"ALTER VIEW {tgt_fq} SET TAGS ({tag_pairs})")
+
+            restore_column_tags(mdef.get("col_tags", []), "VIEW", tgt_fq)
 
             gs, gf = apply_grants(mdef["grants"], "VIEW", tgt_fq, "metric_views", obj_fqn)
             set_owner("VIEW", tgt_fq, mdef["owner"])
@@ -1313,6 +1399,8 @@ elif mv_definitions and sql_warehouse_id:
             if mvdef["tags"]:
                 tag_pairs = ", ".join(f"'{t[0]}' = '{escape_sql(t[1])}'" for t in mvdef["tags"])
                 run_quiet(f"ALTER TABLE {tgt_fq} SET TAGS ({tag_pairs})")
+
+            restore_column_tags(mvdef.get("col_tags", []), "TABLE", tgt_fq)
 
             gs, gf = apply_grants(mvdef["grants"], "TABLE", tgt_fq, "materialized_views", obj_fqn)
             set_owner("TABLE", tgt_fq, mvdef["owner"])
