@@ -120,18 +120,20 @@ if log_catalog not in _existing_catalogs:
     )
 
 if _bootstrap_is_metastore_admin():
-    try:
-        spark.sql(
-            f"GRANT ALL PRIVILEGES ON CATALOG `{log_catalog}` TO `{_bootstrap_user}`"
-        )
-        print(f"Bootstrap: self-granted ALL PRIVILEGES on log catalog '{log_catalog}' "
-              f"(runner '{_bootstrap_user}' is a metastore admin)")
-    except Exception as e:
-        raise RuntimeError(
-            f"Bootstrap FAILED: runner '{_bootstrap_user}' is a metastore admin but could not "
-            f"self-grant on log_catalog '{log_catalog}': {e}. "
-            "Grant USE CATALOG + CREATE SCHEMA + CREATE TABLE on the log catalog manually and re-run."
-        )
+    # MANAGE is a separate privilege from ALL PRIVILEGES in UC — grant both explicitly.
+    for _priv in ("ALL PRIVILEGES", "MANAGE"):
+        try:
+            spark.sql(
+                f"GRANT {_priv} ON CATALOG `{log_catalog}` TO `{_bootstrap_user}`"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Bootstrap FAILED: runner '{_bootstrap_user}' is a metastore admin but could not "
+                f"GRANT {_priv} on log_catalog '{log_catalog}': {e}. "
+                "Grant the required privileges on the log catalog manually and re-run."
+            )
+    print(f"Bootstrap: self-granted ALL PRIVILEGES + MANAGE on log catalog '{log_catalog}' "
+          f"(runner '{_bootstrap_user}' is a metastore admin)")
 
 # ---------------------------------------------------------------------------
 # Log table setup
@@ -656,16 +658,21 @@ if source_owner:
 # and grant-read operations work. The source catalog is renamed to _bkp post-migration,
 # so these transient grants do not affect the final migrated catalog's permissions.
 if is_ms_admin is True:
-    ok_sg, err_sg = run_quiet(
-        f"GRANT ALL PRIVILEGES ON CATALOG {q(catalog_name)} TO `{current_user}`"
-    )
-    if ok_sg:
+    # MANAGE is a separate privilege from ALL PRIVILEGES in UC — grant both.
+    _source_grant_errors = []
+    for _priv in ("ALL PRIVILEGES", "MANAGE"):
+        ok_sg, err_sg = run_quiet(
+            f"GRANT {_priv} ON CATALOG {q(catalog_name)} TO `{current_user}`"
+        )
+        if not ok_sg:
+            _source_grant_errors.append(f"{_priv}: {err_sg}")
+    if not _source_grant_errors:
         _pf_ok("self_grant_source_catalog",
-               f"granted ALL PRIVILEGES on '{catalog_name}' to runner (metastore admin bootstrap)")
+               f"granted ALL PRIVILEGES + MANAGE on '{catalog_name}' to runner (metastore admin bootstrap)")
     else:
         _pf_fail("self_grant_source_catalog",
-                 f"Failed to self-grant ALL PRIVILEGES on '{catalog_name}': {err_sg}. "
-                 "Without these privileges the migration cannot read/clone objects.")
+                 f"Failed to self-grant on '{catalog_name}': {'; '.join(_source_grant_errors)}. "
+                 "Without these privileges the migration cannot read/clone or rename the catalog.")
 
 # 3. USE CATALOG on source
 ok_use, err_use = run_quiet(f"SHOW SCHEMAS IN {q(catalog_name)}")
@@ -733,6 +740,9 @@ except Exception as e:
 
 # 6b. Bootstrap self-grant on external location (metastore admin only) — same rationale as 2b.
 if ext_loc_name and is_ms_admin is True:
+    # External locations do not support MANAGE as a privilege; ownership is the
+    # equivalent. ALL PRIVILEGES covers CREATE MANAGED STORAGE + BROWSE + READ/WRITE FILES,
+    # which is all we need for the migration.
     ok_eg, err_eg = run_quiet(
         f"GRANT ALL PRIVILEGES ON EXTERNAL LOCATION {q(ext_loc_name)} TO `{current_user}`"
     )
