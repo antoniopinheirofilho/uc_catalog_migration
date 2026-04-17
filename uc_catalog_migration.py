@@ -79,6 +79,61 @@ batch_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 print(f"Batch ID: {batch_id}")
 
 # ---------------------------------------------------------------------------
+# Bootstrap: metastore admin self-grant on log_catalog
+# ---------------------------------------------------------------------------
+# The log table is created below, which needs USE CATALOG + CREATE TABLE on
+# log_catalog. Metastore admins have implicit admin-level privileges but
+# data-plane privileges are evaluated separately, so the same self-grant
+# pattern used in preflight for the source catalog is applied here first.
+# This runs BEFORE log table creation because the rest of the notebook
+# depends on the log table. Preflight runs a more complete detection later.
+_bootstrap_w = WorkspaceClient()
+_bootstrap_user = spark.sql("SELECT current_user()").collect()[0][0]
+
+
+def _bootstrap_is_metastore_admin():
+    try:
+        owner = _bootstrap_w.metastores.summary().owner or ""
+        if not owner:
+            return False
+        if owner == _bootstrap_user:
+            return True
+        me = _bootstrap_w.current_user.me()
+        groups = {g.display for g in (me.groups or []) if g.display}
+        return owner in groups
+    except Exception:
+        return False
+
+
+# Verify the log catalog exists before attempting any operation on it.
+# SHOW CATALOGS is visible to any UC-enabled principal and is cheap.
+try:
+    _existing_catalogs = {r[0] for r in spark.sql("SHOW CATALOGS").collect()}
+except Exception as e:
+    raise RuntimeError(f"Bootstrap FAILED: could not list catalogs to verify log_catalog: {e}")
+
+if log_catalog not in _existing_catalogs:
+    raise RuntimeError(
+        f"Bootstrap FAILED: log_catalog '{log_catalog}' does not exist. "
+        f"Create it first (`CREATE CATALOG `{log_catalog}``) and re-run. "
+        "The log catalog holds the migration audit table and must exist before the notebook starts."
+    )
+
+if _bootstrap_is_metastore_admin():
+    try:
+        spark.sql(
+            f"GRANT ALL PRIVILEGES ON CATALOG `{log_catalog}` TO `{_bootstrap_user}`"
+        )
+        print(f"Bootstrap: self-granted ALL PRIVILEGES on log catalog '{log_catalog}' "
+              f"(runner '{_bootstrap_user}' is a metastore admin)")
+    except Exception as e:
+        raise RuntimeError(
+            f"Bootstrap FAILED: runner '{_bootstrap_user}' is a metastore admin but could not "
+            f"self-grant on log_catalog '{log_catalog}': {e}. "
+            "Grant USE CATALOG + CREATE SCHEMA + CREATE TABLE on the log catalog manually and re-run."
+        )
+
+# ---------------------------------------------------------------------------
 # Log table setup
 # ---------------------------------------------------------------------------
 LOG_TABLE = f"{log_catalog}.default.uc_migration_log"
