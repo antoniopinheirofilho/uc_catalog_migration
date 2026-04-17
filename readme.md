@@ -115,7 +115,7 @@ There is a brief window between the two `ALTER CATALOG RENAME` operations where 
 
 Materialized views cannot be cloned. They are recreated in the new catalog after the rename swap, which triggers a full recomputation via a serverless pipeline. Key details:
 
-- **A SQL warehouse is required.** MV operations (DDL capture and creation) cannot run on general-purpose compute. Provide the `sql_warehouse_id` parameter pointing to a running Serverless or Pro SQL warehouse. If omitted, MVs will be skipped.
+- **A SQL warehouse is required.** MV operations (DDL capture, creation, and ownership transfer) cannot run on general-purpose compute — MV ownership changes are processed by DLT's `ChangeDltDatasetOwnerHandler`, which denies `ALTER OWNER` from general compute even for the MV creator. Provide the `sql_warehouse_id` parameter pointing to a running Serverless or Pro SQL warehouse. If omitted, MVs will be skipped.
 - **Internal backing tables** (`__materialization_*`, `event_log_*`) created by the MV pipeline are automatically excluded from DEEP CLONE. They are regenerated when the MV is recreated.
 - For large or complex materialized views, recomputation may take significant time and compute resources.
 
