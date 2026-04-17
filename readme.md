@@ -6,6 +6,7 @@ Migrates a Unity Catalog catalog that was created **without a managed storage lo
 
 The notebook follows a create-migrate-swap pattern:
 
+0. **Preflight** — Verifies runner identity and required privileges (catalog ownership, `CREATE CATALOG`, `CREATE MANAGED STORAGE`), resolves the external location that backs `managed_storage_location`, checks that `<catalog>_aux` and `<catalog>_bkp` don't already exist, and validates the SQL warehouse is reachable. Hard-fails with a consolidated report before any work is done.
 1. **Inventory & Dry Run** — Discovers all objects, detects risks (Delta Sharing, DLT pipelines, out-of-scope objects), and reports what will be migrated.
 2. **Create `<catalog>_aux`** — New catalog with the specified managed storage location.
 3. **Migrate Schemas** — Recreates all schemas (including empty ones) with comments, properties, grants, and ownership.
@@ -32,14 +33,21 @@ The notebook follows a create-migrate-swap pattern:
 
 ### Permissions
 
-The notebook runner must have:
+The preflight cell checks all of the following and hard-fails if any are missing:
 
-- **Metastore admin** (strongly recommended) — required for reading all function definitions, transferring ownership, and managing grants across all objects.
-- **`CREATE CATALOG`** on the metastore.
-- **`USE CATALOG`** and **`SELECT`** on the source catalog and all its objects.
-- Access to the **external location** backing the managed storage location parameter.
+| Scope | Privilege | Why |
+|---|---|---|
+| Source catalog | **Ownership** | Required for `ALTER CATALOG ... RENAME` during cutover, and for full visibility into grants and ownership. |
+| Source catalog | **`USE CATALOG`** (implicit via ownership) | List schemas and objects. |
+| Metastore | **`CREATE CATALOG`** | Create the `<catalog>_aux` catalog. |
+| External location | **`CREATE MANAGED STORAGE`** | Bind the new catalog to the managed storage path. |
 
-If not metastore admin, the runner must be the **owner** of every function to read its definition (otherwise `routine_definition` is NULL in `information_schema.routines`).
+Additional recommendations:
+
+- **Metastore admin** (strongly recommended) — makes ownership transfer, grant reads, and function definition reads trouble-free.
+- If not metastore admin, the runner must be the **owner** of every function to read its definition (otherwise `routine_definition` is NULL in `information_schema.routines`).
+- The external location that covers `managed_storage_location` must already exist. The preflight auto-resolves it by matching path prefixes.
+- The runner also needs `USE CATALOG` + `CREATE SCHEMA` + `CREATE TABLE` on `log_catalog` (verified implicitly — the log table is created at the top of the notebook).
 
 ### Environment
 
@@ -50,7 +58,7 @@ If not metastore admin, the runner must be the **owner** of every function to re
 
 ### Before Running
 
-1. **Run in dry-run mode first** (`dry_run = true`) to review the inventory and warnings.
+1. **Run in dry-run mode first** (`dry_run = true`) — this also runs the full preflight, so any missing privileges or name collisions surface before the actual migration.
 2. **Schedule during a low-activity window** — the rename swap creates a brief moment where the original catalog name doesn't exist.
 3. **Pause any DLT pipelines** that target the source catalog to avoid partial writes during migration.
 4. **Notify stakeholders** if Delta Sharing is in use — share references will need manual updates.
@@ -237,6 +245,7 @@ Only do this after thorough validation and stakeholder sign-off.
 
 | Issue | Cause | Resolution |
 |---|---|---|
+| Notebook exits with `PREFLIGHT_FAILED` | One or more preflight checks failed | Read the printed failure list, resolve each item (missing grant, collision, unreachable warehouse), and re-run |
 | `_aux` catalog already exists | Previous failed run | `DROP CATALOG <catalog>_aux CASCADE` and re-run |
 | `_bkp` catalog already exists | Previous migration | Drop it if no longer needed, or rename it |
 | View creation fails after swap | Dependency on unmigrated object (external table, streaming table) | Manually recreate the view, adjusting references |

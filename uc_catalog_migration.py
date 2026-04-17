@@ -9,6 +9,7 @@
 # MAGIC to a new catalog that has a proper managed storage location configured.
 # MAGIC
 # MAGIC ## Migration Flow
+# MAGIC 0. **Preflight** — Verify runner identity, required privileges, external location resolution, and name collisions. Hard-fails before any work is done.
 # MAGIC 1. **Inventory** — Discover all objects in the source catalog and produce a dry-run report
 # MAGIC 2. **Create target catalog** (`<catalog>_aux`) with the specified managed storage location
 # MAGIC 3. **Migrate schemas** (including empty ones) — properties, comments, grants, ownership
@@ -258,7 +259,9 @@ def get_schema_info(cat, schema):
 
 
 def get_grants(object_type, full_name_quoted):
-    """Return list of (principal, action_type) tuples for direct grants."""
+    """Return list of (principal, action_type) tuples for DIRECT grants only.
+    Filters out inherited grants from parent objects (e.g., catalog-level grants
+    showing up on schema queries) by checking the object_type column."""
     ok, df = run_quiet(f"SHOW GRANTS ON {object_type} {full_name_quoted}")
     if not ok:
         return []
@@ -267,7 +270,12 @@ def get_grants(object_type, full_name_quoted):
     for r in rows:
         principal = r[0]
         action_type = r[1]
-        results.append((principal, action_type))
+        # SHOW GRANTS returns columns: principal, action_type, object_type, object_key
+        # Only include grants where object_type matches what we asked for (direct grants).
+        # Inherited grants from parent objects have a different object_type.
+        grant_object_type = r[2] if len(r) > 2 else object_type
+        if grant_object_type.upper() == object_type.upper():
+            results.append((principal, action_type))
     return results
 
 
@@ -461,6 +469,202 @@ def get_ddl(cat, schema, obj):
     if not ok:
         return None
     return df.first()[0]
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Preflight Checks
+# MAGIC
+# MAGIC Validates runner identity, required privileges, external location resolution, and name
+# MAGIC collisions. Any FAIL aborts the run before inventory or migration begins.
+
+# COMMAND ----------
+
+print("Running preflight checks ...")
+print("=" * 60)
+
+w = WorkspaceClient()
+
+current_user = spark.sql("SELECT current_user()").collect()[0][0]
+print(f"Current user: {current_user}")
+
+preflight_findings = []  # list of (severity, check, detail)
+
+
+def _pf_ok(check, detail=""):
+    preflight_findings.append(("OK", check, detail))
+    print(f"  OK    {check}" + (f": {detail}" if detail else ""))
+    write_log("preflight", "CHECK", check, "OK", detail)
+
+
+def _pf_warn(check, detail):
+    preflight_findings.append(("WARN", check, detail))
+    print(f"  WARN  {check}: {detail}")
+    write_log("preflight", "CHECK", check, "WARN", detail)
+
+
+def _pf_fail(check, detail):
+    preflight_findings.append(("FAIL", check, detail))
+    print(f"  FAIL  {check}: {detail}")
+    write_log("preflight", "CHECK", check, "FAIL", detail)
+
+
+def _norm_priv(action):
+    """Normalize privilege strings so 'CREATE CATALOG', 'CREATE_CATALOG', 'createcatalog' all match."""
+    return action.replace("_", "").replace(" ", "").upper()
+
+
+def _grants_for(principal, object_type, object_ref=""):
+    """Return (set_of_normalized_action_types, error_string_or_None).
+    Includes privileges inherited via group membership."""
+    target = f"{object_type} {object_ref}".strip()
+    ok, df = run_quiet(f"SHOW GRANTS `{principal}` ON {target}")
+    if not ok:
+        return None, str(df)
+    actions = set()
+    for r in df.collect():
+        if len(r) >= 2 and r[1]:
+            actions.add(_norm_priv(r[1]))
+    return actions, None
+
+
+# 1. Source catalog exists and owner is readable
+source_owner = None
+try:
+    source_info = get_catalog_info(catalog_name)
+    source_owner = source_info.get("owner") or ""
+    if source_owner:
+        _pf_ok("source_catalog_exists", f"owner={source_owner}")
+    else:
+        _pf_warn("source_catalog_exists", "Catalog exists but owner could not be read")
+except Exception as e:
+    _pf_fail("source_catalog_exists", f"Catalog '{catalog_name}' not found or inaccessible: {e}")
+
+# 2. Runner is the source catalog owner (required for ALTER CATALOG RENAME during cutover)
+if source_owner:
+    if current_user == source_owner:
+        _pf_ok("source_catalog_owner", "runner is the catalog owner")
+    else:
+        _pf_fail(
+            "source_catalog_owner",
+            f"Runner '{current_user}' is not the source catalog owner (owner='{source_owner}'). "
+            "Ownership is required to rename the catalog during cutover. "
+            "Transfer ownership to the runner (or run as the owner) before executing."
+        )
+
+# 3. USE CATALOG on source
+ok_use, err_use = run_quiet(f"SHOW SCHEMAS IN {q(catalog_name)}")
+if ok_use:
+    _pf_ok("source_catalog_use_catalog")
+else:
+    _pf_fail("source_catalog_use_catalog", f"Cannot list schemas in source catalog: {err_use}")
+
+# 4. Name collisions — aux and bkp must not already exist
+try:
+    existing_catalogs = {r[0] for r in run("SHOW CATALOGS").collect()}
+    if aux_catalog in existing_catalogs:
+        _pf_fail("aux_catalog_free", f"Catalog '{aux_catalog}' already exists — drop it before running")
+    else:
+        _pf_ok("aux_catalog_free", f"'{aux_catalog}' is available")
+    if bkp_catalog in existing_catalogs:
+        _pf_fail("bkp_catalog_free", f"Catalog '{bkp_catalog}' already exists — drop or rename it before running")
+    else:
+        _pf_ok("bkp_catalog_free", f"'{bkp_catalog}' is available")
+except Exception as e:
+    _pf_warn("catalog_collision_check", f"Could not list catalogs: {e}")
+
+# 5. CREATE CATALOG privilege at metastore level (owner can also create via ownership transfer flow)
+actions_ms, err_ms = _grants_for(current_user, "METASTORE")
+if actions_ms is None:
+    _pf_warn("metastore_create_catalog", f"Could not read metastore grants: {err_ms}. "
+             "Metastore admins typically have implicit CREATE CATALOG.")
+else:
+    if any(a in actions_ms for a in ("CREATECATALOG", "ALLPRIVILEGES")):
+        _pf_ok("metastore_create_catalog", "CREATE CATALOG granted at metastore")
+    else:
+        _pf_fail(
+            "metastore_create_catalog",
+            f"Runner lacks CREATE CATALOG on the metastore. Granted: {sorted(actions_ms) or 'none'}. "
+            "Request CREATE CATALOG from your metastore admin."
+        )
+
+# 6. Resolve external location that covers the managed storage path
+ext_loc_name = None
+normalized_path = managed_storage_location.rstrip("/")
+try:
+    all_locs = list(w.external_locations.list())
+    matching = []
+    for loc in all_locs:
+        url = (loc.url or "").rstrip("/")
+        if url and (normalized_path == url or normalized_path.startswith(url + "/")):
+            matching.append(loc)
+    if matching:
+        # Prefer the longest-prefix (most specific) match
+        best = max(matching, key=lambda l: len(l.url or ""))
+        ext_loc_name = best.name
+        _pf_ok("external_location_exists",
+               f"'{ext_loc_name}' covers '{managed_storage_location}'")
+    else:
+        _pf_fail(
+            "external_location_exists",
+            f"No external location covers path '{managed_storage_location}'. "
+            "Create an external location for this path and grant CREATE MANAGED STORAGE to the runner."
+        )
+except Exception as e:
+    _pf_warn("external_location_exists",
+             f"Could not list external locations via SDK: {e}. "
+             "Verify manually that the external location exists and the runner has CREATE MANAGED STORAGE.")
+
+# 7. CREATE MANAGED STORAGE on the external location
+if ext_loc_name:
+    actions_el, err_el = _grants_for(current_user, "EXTERNAL LOCATION", q(ext_loc_name))
+    if actions_el is None:
+        _pf_warn("external_location_privilege", f"Could not read grants on '{ext_loc_name}': {err_el}")
+    elif any(a in actions_el for a in ("CREATEMANAGEDSTORAGE", "ALLPRIVILEGES")):
+        _pf_ok("external_location_privilege", f"CREATE MANAGED STORAGE granted on '{ext_loc_name}'")
+    else:
+        _pf_fail(
+            "external_location_privilege",
+            f"Runner lacks CREATE MANAGED STORAGE on '{ext_loc_name}'. "
+            f"Granted: {sorted(actions_el) or 'none'}. Request CREATE MANAGED STORAGE from the location owner."
+        )
+
+# 8. SQL warehouse accessibility (if provided)
+if sql_warehouse_id:
+    try:
+        wh = w.warehouses.get(sql_warehouse_id)
+        state = wh.state.value if wh.state else "UNKNOWN"
+        _pf_ok("sql_warehouse", f"{wh.name} (state={state})")
+    except Exception as e:
+        _pf_fail("sql_warehouse", f"Cannot access warehouse '{sql_warehouse_id}': {e}")
+
+# ---------------------------------------------------------------------------
+# Preflight summary — hard fail if any check failed
+# ---------------------------------------------------------------------------
+fails = [f for f in preflight_findings if f[0] == "FAIL"]
+warns = [f for f in preflight_findings if f[0] == "WARN"]
+oks = [f for f in preflight_findings if f[0] == "OK"]
+
+print("=" * 60)
+print(f"Preflight summary: {len(oks)} OK, {len(warns)} WARN, {len(fails)} FAIL")
+print("=" * 60)
+
+if fails:
+    print("\nPreflight FAILED. Resolve the following before re-running:")
+    for _, check, detail in fails:
+        print(f"  - {check}: {detail}")
+    write_log("preflight", "SUMMARY", catalog_name, "FAIL",
+              f"{len(fails)} failed, {len(warns)} warnings")
+    dbutils.notebook.exit("PREFLIGHT_FAILED")
+
+if warns:
+    print("\nWarnings (non-blocking):")
+    for _, check, detail in warns:
+        print(f"  - {check}: {detail}")
+
+write_log("preflight", "SUMMARY", catalog_name, "SUCCESS",
+          f"{len(oks)} OK, {len(warns)} warnings")
+print("\nPreflight passed.")
 
 # COMMAND ----------
 
