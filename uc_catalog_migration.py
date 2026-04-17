@@ -1339,13 +1339,24 @@ for fn_row in functions:
         gs, gf = apply_grants(f_grants, "FUNCTION", tgt_fq, "functions", obj_fqn)
 
         ok_own, owner_df = run_quiet(f"""
-            SELECT specific_owner FROM {q(catalog_name)}.information_schema.routines
+            SELECT routine_owner FROM {q(catalog_name)}.information_schema.routines
             WHERE routine_schema = '{schema}' AND routine_name = '{func_name}'
         """)
+        fn_owner = None
         if ok_own:
             row = owner_df.first()
             if row and row[0]:
-                set_owner("FUNCTION", tgt_fq, row[0])
+                fn_owner = row[0]
+                ok_setown = set_owner("FUNCTION", tgt_fq, fn_owner)
+                if not ok_setown:
+                    write_log("functions", "OWNER", obj_fqn, "WARN",
+                              f"Failed to set owner to {fn_owner}")
+            else:
+                write_log("functions", "OWNER", obj_fqn, "WARN",
+                          "routine_owner is NULL — owner not transferred")
+        else:
+            write_log("functions", "OWNER", obj_fqn, "WARN",
+                      f"Could not read routine_owner: {owner_df}")
 
         elapsed = time.time() - t0
         write_log("functions", "FUNCTION", obj_fqn, "SUCCESS", f"grants={gs}", elapsed)
