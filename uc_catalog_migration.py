@@ -594,6 +594,24 @@ if source_owner:
         else:
             _pf_fail("source_catalog_rename_privilege", msg)
 
+# 2b. Bootstrap self-grant on source catalog (metastore admin only)
+# Metastore admins have implicit admin privileges (rename/grant/drop) but data-plane
+# privileges like USE CATALOG, SELECT, and READ VOLUME are evaluated separately and
+# can be missing. Self-granting ALL PRIVILEGES here ensures inventory, DEEP CLONE,
+# and grant-read operations work. The source catalog is renamed to _bkp post-migration,
+# so these transient grants do not affect the final migrated catalog's permissions.
+if is_ms_admin is True:
+    ok_sg, err_sg = run_quiet(
+        f"GRANT ALL PRIVILEGES ON CATALOG {q(catalog_name)} TO `{current_user}`"
+    )
+    if ok_sg:
+        _pf_ok("self_grant_source_catalog",
+               f"granted ALL PRIVILEGES on '{catalog_name}' to runner (metastore admin bootstrap)")
+    else:
+        _pf_fail("self_grant_source_catalog",
+                 f"Failed to self-grant ALL PRIVILEGES on '{catalog_name}': {err_sg}. "
+                 "Without these privileges the migration cannot read/clone objects.")
+
 # 3. USE CATALOG on source
 ok_use, err_use = run_quiet(f"SHOW SCHEMAS IN {q(catalog_name)}")
 if ok_use:
@@ -657,6 +675,19 @@ except Exception as e:
     _pf_warn("external_location_exists",
              f"Could not list external locations via SDK: {e}. "
              "Verify manually that the external location exists and the runner has CREATE MANAGED STORAGE.")
+
+# 6b. Bootstrap self-grant on external location (metastore admin only) — same rationale as 2b.
+if ext_loc_name and is_ms_admin is True:
+    ok_eg, err_eg = run_quiet(
+        f"GRANT ALL PRIVILEGES ON EXTERNAL LOCATION {q(ext_loc_name)} TO `{current_user}`"
+    )
+    if ok_eg:
+        _pf_ok("self_grant_external_location",
+               f"granted ALL PRIVILEGES on '{ext_loc_name}' to runner (metastore admin bootstrap)")
+    else:
+        _pf_fail("self_grant_external_location",
+                 f"Failed to self-grant ALL PRIVILEGES on '{ext_loc_name}': {err_eg}. "
+                 "Without these privileges the new catalog cannot bind to the managed storage location.")
 
 # 7. CREATE MANAGED STORAGE on the external location — metastore admins have this implicitly
 if ext_loc_name:

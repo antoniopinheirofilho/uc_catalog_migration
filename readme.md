@@ -44,6 +44,8 @@ The preflight cell checks all of the following and hard-fails if any are missing
 
 How metastore admin is detected: the preflight calls `WorkspaceClient.metastores.summary()` to read the metastore owner, then compares against the runner's identity and direct group memberships (via `current_user.me()`). If the check is inconclusive (e.g., group membership isn't visible), the ownership check downgrades to a `WARN` rather than a `FAIL`, so admins aren't blocked.
 
+**Metastore admin bootstrap — self-grant:** Metastore admins have implicit admin-level privileges (rename, drop, grant) but data-plane privileges (`USE CATALOG`, `SELECT`, `READ VOLUME`) are evaluated separately and can still be missing. When the preflight confirms the runner is a metastore admin, it automatically issues `GRANT ALL PRIVILEGES ON CATALOG <source> TO <runner>` and the same on the matched external location. These grants are transient — the source catalog becomes `<source>_bkp` after the rename swap, so they do not affect the final migrated catalog. They can be revoked (or the `_bkp` catalog dropped) after validation.
+
 Additional recommendations:
 
 - **Metastore admin** (strongly recommended) — makes ownership transfer, grant reads, and function definition reads trouble-free.
