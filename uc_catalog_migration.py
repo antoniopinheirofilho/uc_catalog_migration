@@ -655,7 +655,24 @@ if fails:
         print(f"  - {check}: {detail}")
     write_log("preflight", "SUMMARY", catalog_name, "FAIL",
               f"{len(fails)} failed, {len(warns)} warnings")
-    dbutils.notebook.exit("PREFLIGHT_FAILED")
+    # Raise instead of dbutils.notebook.exit — job runs and notebook-result views
+    # only surface the exit string, so the FAIL list above gets hidden. An exception
+    # carries the full detail into the error surface.
+    failure_report_lines = [
+        f"PREFLIGHT_FAILED — {len(fails)} check(s) failed for catalog '{catalog_name}' "
+        f"(runner: {current_user}, batch_id: {batch_id}).",
+        "",
+        "Failed checks:",
+    ]
+    for _, check, detail in fails:
+        failure_report_lines.append(f"  - {check}: {detail}")
+    failure_report_lines += [
+        "",
+        f"Full detail is also logged to {LOG_TABLE}. Query with:",
+        f"  SELECT object_name AS check_name, status, message FROM {LOG_TABLE}",
+        f"  WHERE batch_id = '{batch_id}' AND phase = 'preflight' AND status = 'FAIL'",
+    ]
+    raise RuntimeError("\n".join(failure_report_lines))
 
 if warns:
     print("\nWarnings (non-blocking):")
