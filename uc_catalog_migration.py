@@ -1545,7 +1545,20 @@ elif mv_definitions and sql_warehouse_id:
             restore_column_tags(mvdef.get("col_tags", []), "TABLE", tgt_fq)
 
             gs, gf = apply_grants(mvdef["grants"], "TABLE", tgt_fq, "materialized_views", obj_fqn)
-            set_owner("TABLE", tgt_fq, mvdef["owner"])
+
+            # MV ownership changes are handled by DLT's ChangeDltDatasetOwnerHandler,
+            # which denies ALTER OWNER when issued from general-purpose compute — even
+            # for the MV creator. Route it through the same SQL warehouse that created
+            # the MV so the command runs in the expected execution context.
+            if mvdef["owner"]:
+                owner_sql = f"ALTER TABLE {tgt_fq} SET OWNER TO `{mvdef['owner']}`"
+                ok_own, err_own = run_on_warehouse(owner_sql, sql_warehouse_id)
+                if ok_own:
+                    print(f"    Owner set to {mvdef['owner']} via SQL warehouse")
+                else:
+                    print(f"    WARN set owner {mvdef['owner']} (via warehouse): {err_own}")
+                    write_log("materialized_views", "OWNER", obj_fqn, "WARN",
+                              f"Failed to set owner to {mvdef['owner']}: {err_own}")
 
             elapsed = time.time() - t0
             write_log("materialized_views", "MATERIALIZED_VIEW", obj_fqn, "SUCCESS",
