@@ -528,6 +528,38 @@ def _grants_for(principal, object_type, object_ref=""):
     return actions, None
 
 
+def _is_metastore_admin(user):
+    """Return (bool_or_None, metastore_owner_or_error).
+    Metastore admins have implicit privileges on every securable in the metastore,
+    including the right to rename any catalog. A user is considered a metastore admin
+    if they are (or are a member of the group that is) the metastore owner."""
+    try:
+        summary = w.metastores.summary()
+        metastore_owner = summary.owner or ""
+        if not metastore_owner:
+            return None, "metastore owner is empty"
+        if metastore_owner == user:
+            return True, metastore_owner
+        # Check group membership (direct memberships from SCIM)
+        me = w.current_user.me()
+        user_groups = {g.display for g in (me.groups or []) if g.display}
+        if metastore_owner in user_groups:
+            return True, metastore_owner
+        return False, metastore_owner
+    except Exception as e:
+        return None, f"could not determine metastore admin status: {e}"
+
+
+# 0. Metastore admin detection (informational — affects subsequent ownership check)
+is_ms_admin, ms_admin_detail = _is_metastore_admin(current_user)
+if is_ms_admin is True:
+    _pf_ok("metastore_admin", f"runner is a metastore admin (via owner '{ms_admin_detail}')")
+elif is_ms_admin is False:
+    # Informational — not a failure on its own. The ownership check decides whether to proceed.
+    _pf_ok("metastore_admin", f"runner is NOT a metastore admin (metastore owner: '{ms_admin_detail}')")
+else:
+    _pf_warn("metastore_admin", ms_admin_detail)
+
 # 1. Source catalog exists and owner is readable
 source_owner = None
 try:
@@ -540,17 +572,27 @@ try:
 except Exception as e:
     _pf_fail("source_catalog_exists", f"Catalog '{catalog_name}' not found or inaccessible: {e}")
 
-# 2. Runner is the source catalog owner (required for ALTER CATALOG RENAME during cutover)
+# 2. Runner can rename the catalog — owner OR metastore admin
 if source_owner:
     if current_user == source_owner:
-        _pf_ok("source_catalog_owner", "runner is the catalog owner")
+        _pf_ok("source_catalog_rename_privilege", "runner is the catalog owner")
+    elif is_ms_admin is True:
+        _pf_ok("source_catalog_rename_privilege",
+               "runner is a metastore admin (implicit rename privilege)")
     else:
-        _pf_fail(
-            "source_catalog_owner",
-            f"Runner '{current_user}' is not the source catalog owner (owner='{source_owner}'). "
-            "Ownership is required to rename the catalog during cutover. "
-            "Transfer ownership to the runner (or run as the owner) before executing."
+        msg = (
+            f"Runner '{current_user}' is neither the source catalog owner "
+            f"(owner='{source_owner}') nor a confirmed metastore admin. "
+            "One of the two is required for ALTER CATALOG ... RENAME during cutover. "
+            "Either transfer ownership to the runner, run as the owner, or run as a metastore admin."
         )
+        if is_ms_admin is None:
+            # Couldn't determine admin status — downgrade to WARN instead of FAIL
+            # so admins whose group membership isn't visible via SCIM can still proceed.
+            _pf_warn("source_catalog_rename_privilege",
+                     msg + f" (metastore admin check inconclusive: {ms_admin_detail})")
+        else:
+            _pf_fail("source_catalog_rename_privilege", msg)
 
 # 3. USE CATALOG on source
 ok_use, err_use = run_quiet(f"SHOW SCHEMAS IN {q(catalog_name)}")
@@ -573,13 +615,14 @@ try:
 except Exception as e:
     _pf_warn("catalog_collision_check", f"Could not list catalogs: {e}")
 
-# 5. CREATE CATALOG privilege at metastore level (owner can also create via ownership transfer flow)
-actions_ms, err_ms = _grants_for(current_user, "METASTORE")
-if actions_ms is None:
-    _pf_warn("metastore_create_catalog", f"Could not read metastore grants: {err_ms}. "
-             "Metastore admins typically have implicit CREATE CATALOG.")
+# 5. CREATE CATALOG privilege at metastore level — metastore admins have this implicitly
+if is_ms_admin is True:
+    _pf_ok("metastore_create_catalog", "implicit via metastore admin")
 else:
-    if any(a in actions_ms for a in ("CREATECATALOG", "ALLPRIVILEGES")):
+    actions_ms, err_ms = _grants_for(current_user, "METASTORE")
+    if actions_ms is None:
+        _pf_warn("metastore_create_catalog", f"Could not read metastore grants: {err_ms}.")
+    elif any(a in actions_ms for a in ("CREATECATALOG", "ALLPRIVILEGES")):
         _pf_ok("metastore_create_catalog", "CREATE CATALOG granted at metastore")
     else:
         _pf_fail(
@@ -615,19 +658,22 @@ except Exception as e:
              f"Could not list external locations via SDK: {e}. "
              "Verify manually that the external location exists and the runner has CREATE MANAGED STORAGE.")
 
-# 7. CREATE MANAGED STORAGE on the external location
+# 7. CREATE MANAGED STORAGE on the external location — metastore admins have this implicitly
 if ext_loc_name:
-    actions_el, err_el = _grants_for(current_user, "EXTERNAL LOCATION", q(ext_loc_name))
-    if actions_el is None:
-        _pf_warn("external_location_privilege", f"Could not read grants on '{ext_loc_name}': {err_el}")
-    elif any(a in actions_el for a in ("CREATEMANAGEDSTORAGE", "ALLPRIVILEGES")):
-        _pf_ok("external_location_privilege", f"CREATE MANAGED STORAGE granted on '{ext_loc_name}'")
+    if is_ms_admin is True:
+        _pf_ok("external_location_privilege", f"implicit via metastore admin on '{ext_loc_name}'")
     else:
-        _pf_fail(
-            "external_location_privilege",
-            f"Runner lacks CREATE MANAGED STORAGE on '{ext_loc_name}'. "
-            f"Granted: {sorted(actions_el) or 'none'}. Request CREATE MANAGED STORAGE from the location owner."
-        )
+        actions_el, err_el = _grants_for(current_user, "EXTERNAL LOCATION", q(ext_loc_name))
+        if actions_el is None:
+            _pf_warn("external_location_privilege", f"Could not read grants on '{ext_loc_name}': {err_el}")
+        elif any(a in actions_el for a in ("CREATEMANAGEDSTORAGE", "ALLPRIVILEGES")):
+            _pf_ok("external_location_privilege", f"CREATE MANAGED STORAGE granted on '{ext_loc_name}'")
+        else:
+            _pf_fail(
+                "external_location_privilege",
+                f"Runner lacks CREATE MANAGED STORAGE on '{ext_loc_name}'. "
+                f"Granted: {sorted(actions_el) or 'none'}. Request CREATE MANAGED STORAGE from the location owner."
+            )
 
 # 8. SQL warehouse accessibility (if provided)
 if sql_warehouse_id:

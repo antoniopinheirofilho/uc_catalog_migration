@@ -33,14 +33,16 @@ The notebook follows a create-migrate-swap pattern:
 
 ### Permissions
 
-The preflight cell checks all of the following and hard-fails if any are missing:
+The preflight cell checks all of the following and hard-fails if any are missing. **Metastore admins satisfy every check implicitly** — if the runner is a metastore admin, the ownership / `CREATE CATALOG` / `CREATE MANAGED STORAGE` checks auto-pass without needing explicit grants.
 
 | Scope | Privilege | Why |
 |---|---|---|
-| Source catalog | **Ownership** | Required for `ALTER CATALOG ... RENAME` during cutover, and for full visibility into grants and ownership. |
-| Source catalog | **`USE CATALOG`** (implicit via ownership) | List schemas and objects. |
-| Metastore | **`CREATE CATALOG`** | Create the `<catalog>_aux` catalog. |
-| External location | **`CREATE MANAGED STORAGE`** | Bind the new catalog to the managed storage path. |
+| Source catalog | **Ownership** OR metastore admin | Required for `ALTER CATALOG ... RENAME` during cutover. |
+| Source catalog | **`USE CATALOG`** | List schemas and objects. |
+| Metastore | **`CREATE CATALOG`** OR metastore admin | Create the `<catalog>_aux` catalog. |
+| External location | **`CREATE MANAGED STORAGE`** OR metastore admin | Bind the new catalog to the managed storage path. |
+
+How metastore admin is detected: the preflight calls `WorkspaceClient.metastores.summary()` to read the metastore owner, then compares against the runner's identity and direct group memberships (via `current_user.me()`). If the check is inconclusive (e.g., group membership isn't visible), the ownership check downgrades to a `WARN` rather than a `FAIL`, so admins aren't blocked.
 
 Additional recommendations:
 
